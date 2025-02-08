@@ -39,13 +39,19 @@ const (
 	TcpConnTimeout  = 10 * time.Second
 )
 
+type ConnTicker struct {
+	ticker            *time.Ticker
+	keepAliveInterval int
+}
+
 type Client struct {
 	id         string
-	conn       net.Conn
+	conn       *net.Conn
 	ctx        context.Context
 	cancel     context.CancelFunc
 	outboxChan chan Packet
 	inboxChan  chan Packet
+	connTicker *ConnTicker
 }
 
 type Packet struct {
@@ -92,31 +98,31 @@ func handlePayload(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *C
 
 	// CONNECT
 	if firstFourHeaderBits == CONNECT_BYTE {
-
+		procConn(receivedData, dataLength, client)
 	}
 	// DISCONNECT
 	if firstFourHeaderBits == DISCONNECT_BYTE {
-
+		procDisconnect(receivedData, dataLength, client)
 	}
 
 	// PUBLISH
 	if firstFourHeaderBits == PUBLISH_BYTE {
-
+		procPublish(receivedData, dataLength, client)
 	}
 
 	// SUBSCRIBE
 	if firstFourHeaderBits == SUBSCRIBE_BYTE {
-
+		procSubscription(receivedData, dataLength, client)
 	}
 
 	// UNSUBSCRIBE
 	if firstFourHeaderBits == UNSUBACK_BYTE {
-
+		procUnsub(receivedData, dataLength, client)
 	}
 
-	// PINGRESP
+	// PINGREQ
 	if firstFourHeaderBits == PINGRESP_BYTE {
-
+		procPingreq(receivedData, dataLength, client)
 	}
 
 	log.Printf("Error: could not interpret packet type. Received data: %s\n", *receivedData)
@@ -125,39 +131,80 @@ func handlePayload(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *C
 
 func connOutbbox(client *Client) {
 	for {
+		select {
+		case <-client.ctx.Done():
+			log.Printf("Ended connection outbox for clientId: %s.\n", client.id)
+			return
+		default:
 
+		}
 	}
 }
 
 func connInbox(client *Client) {
 	for {
-		var receivedData [MAX_DATA_SIZE]byte
-		dataLength, err := client.conn.Read(receivedData[:])
-		if err != nil {
-			log.Printf("Error: problems while handling conn read op: %s\n", err)
-			client.cancel()
+		select {
+		case <-client.ctx.Done():
+			log.Printf("Ended connection inbox for clientId: %s.\n", client.id)
+			return
+		default:
+			var receivedData [MAX_DATA_SIZE]byte
+			dataLength, err := (*client.conn).Read(receivedData[:])
+			if err != nil {
+				log.Printf("Error: problems while handling conn read op: %s\n", err)
+				client.cancel()
+			}
+			handlePayload(&receivedData, &dataLength, client)
 		}
-		go handlePayload(&receivedData, &dataLength, client)
 	}
 }
 
-func procSubscription(receivedData *[MAX_DATA_SIZE]byte, conn *net.Conn) {
-	(*conn).SetDeadline(time.Now().Add(MqttConnTimeout))
-}
-
-func procPublish(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, conn *net.Conn) {
-	(*conn).SetDeadline(time.Now().Add(MqttConnTimeout))
+func procPublish(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
 	var payload Packet
 	err := json.Unmarshal(bytes.TrimRight((*receivedData)[:*dataLength], "\x00"), &payload)
 	if err != nil {
 		log.Printf("Error: received data does not comply with expected format: %s\n", err)
-		(*conn).Close()
+		(*client.conn).Close()
 	}
-
 }
 
-func procConn(receivedData *[MAX_DATA_SIZE]byte, conn *Client) {
+func procConn(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
+	// Ativar ou não mecanismo de keep alive
+}
 
+func procDisconnect(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
+}
+
+func procPingreq(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
+}
+
+func procSubscription(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
+}
+
+func procUnsub(receivedData *[MAX_DATA_SIZE]byte, dataLength *int, client *Client) {
+}
+
+func keepaliveTracker(client *Client) {
+	for {
+		select {
+		case <-client.ctx.Done():
+
+		default:
+			if client.connTicker != nil {
+				select {
+				case <-client.connTicker.ticker.C:
+					client.connTicker.keepAliveInterval--
+					if client.connTicker.keepAliveInterval == 0 {
+						client.cancel()
+					}
+				}
+			}
+		}
+	}
+}
+
+func createPingreqPacket(client *Client) (packet Packet) {
+	return packet
 }
 
 func handleConnection(conn *net.Conn, appCtx *context.Context) {
@@ -165,13 +212,13 @@ func handleConnection(conn *net.Conn, appCtx *context.Context) {
 
 	newClient := Client{
 		id:         strconv.Itoa(generateRandomId()),
-		conn:       *conn,
+		conn:       conn,
 		ctx:        clientCtx,
 		cancel:     cancel,
 		outboxChan: make(chan Packet, 100),
 		inboxChan:  make(chan Packet, 100),
+		connTicker: nil,
 	}
-	newClient.conn.SetDeadline(time.Now().Add(TcpConnTimeout))
 
 	go connInbox(&newClient)
 	go connOutbbox(&newClient)
