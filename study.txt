@@ -1,0 +1,3 @@
+Packet structure:
+https://www.hivemq.com/blog/mqtt-packets-comprehensive-guide/
+
