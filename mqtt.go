@@ -97,58 +97,57 @@ func generateRandomId() int {
 	return rand.Intn(10000)
 }
 
-func handlePayload(receivedData *[]byte, dataLength *int, client *Client) (err error) {
-	// 10 | 1F <- Fixed header (1. packet type 2. remaining packet length)
-	// 00 04 | 4D 51 54 54 | 05 | C2 | 00 3C <- Variable header (Order: 1. Protocol name length; 2. Protocol name; 3. Protocol level; 4. Connect flags; 5. Keep alive)
-	if len(*receivedData) < 10 {
-		err = errors.New("Packet length invalid.")
+func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
+	if len(*data) < 2 {
+		err = errors.New("Packet length invalid for any MQTT packet.")
+		log.Printf("Received data: % X", *data)
 		return err
 	}
 
-	packetTypeBits := (*receivedData)[0] >> 4
+	packetTypeBits := (*data)[0] >> 4
 
 	// CONNECT
 	if packetTypeBits == CONNECT_PACKET_ID {
-		protocolNameLength := int(binary.BigEndian.Uint16((*receivedData)[2:4]))
+		protocolNameLength := int(binary.BigEndian.Uint16((*data)[2:4]))
 		if protocolNameLength != 4 {
-			err = errors.New(fmt.Sprintf("Unsuported protocol length. Ending connection. Received data: % X\n", *receivedData))
+			err = errors.New(fmt.Sprintf("Unsuported protocol length. Ending connection. Received data: % X\n", *data))
 			return err
 		}
 
-		protocolName := string((*receivedData)[4:8])
+		protocolName := string((*data)[4:8])
 		if protocolName != "MQTT" {
-			err = errors.New(fmt.Sprintf("Unsuported protocol name. Ending connection. Received data: % X\n", *receivedData))
+			err = errors.New(fmt.Sprintf("Unsuported protocol name. Ending connection. Received data: % X\n", *data))
 			return err
 		}
 
-		return procConn(receivedData, dataLength, client)
+		return procConn(data, dataLength, client)
 	}
 	// DISCONNECT
 	if packetTypeBits == DISCONNECT_PACKET_ID {
-		procDisconnect(receivedData, dataLength, client)
+		procDisconnect(data, dataLength, client)
 	}
 
 	// PUBLISH
 	if packetTypeBits == PUBLISH_PACKET_ID {
-		procPublish(receivedData, dataLength, client)
+		procPublish(data, dataLength, client)
 	}
 
 	// SUBSCRIBE
 	if packetTypeBits == SUBSCRIBE_PACKET_ID {
-		procSubscription(receivedData, dataLength, client)
+		procSubscription(data, dataLength, client)
 	}
 
 	// UNSUBSCRIBE
 	if packetTypeBits == UNSUBACK_PACKET_ID {
-		procUnsub(receivedData, dataLength, client)
+		procUnsub(data, dataLength, client)
 	}
 
 	// PINGREQ
 	if packetTypeBits == PINGREQ_PACKET_ID {
-		procPingreq(receivedData, dataLength, client)
+		procPingreq(data, dataLength, client)
 	}
 
-	err = errors.New(fmt.Sprintf("Error: could not interpret packet type. Received data: %s\n", *receivedData))
+	err = errors.New(fmt.Sprintf("Error: could not interpret packet type. Received data: %s\n", *data))
 	return err
 }
 
@@ -185,7 +184,6 @@ func connOutbbox(client *Client) {
 				}
 
 				log.Println("Message successfully written.")
-
 				writeWaitGroup.Done()
 			default:
 				continue
@@ -201,16 +199,20 @@ func connInbox(client *Client) {
 			log.Printf("Ended connection inbox for clientId: %s.\n", client.id)
 			return
 		default:
-			var receivedData []byte
-			dataLength, err := (*client.conn).Read(receivedData[:])
+			receivedData := make([]byte, 128)
+			dataLength, err := (*client.conn).Read(receivedData)
 			if err != nil {
 				log.Printf("Error: problems while handling conn read op: %s\n", err)
 				client.cancel()
 			}
-			err = handlePayload(&receivedData, &dataLength, client)
-			if err != nil {
-				log.Printf("%s", err)
-				continue
+			if dataLength > 0 {
+				trimmedData := make([]byte, dataLength)
+				copy(trimmedData, receivedData[:dataLength])
+				err = handlePayload(&trimmedData, &dataLength, client)
+				if err != nil {
+					log.Printf("%s", err)
+					client.cancel()
+				}
 			}
 		}
 	}
