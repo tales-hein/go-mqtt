@@ -42,18 +42,30 @@ const (
 )
 
 type ConnTicker struct {
-	ticker            *time.Ticker
-	keepAliveInterval int
+	ticker             *time.Ticker
+	keepAliveCountdown int
+}
+
+type Flags struct {
+	hasUsername  bool
+	hasPassword  bool
+	cleanSession bool
+	reserved     bool
+	hasWill      bool
+	willRetain   bool
+	willQOS      int
+	keepAlive    int
 }
 
 type Client struct {
 	id         string
-	conn       *net.Conn
 	ctx        context.Context
 	cancel     context.CancelFunc
 	outboxChan chan Packet
 	inboxChan  chan Packet
+	conn       *net.Conn
 	connTicker *ConnTicker
+	flags      *Flags
 }
 
 type Packet struct {
@@ -120,8 +132,9 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 			return err
 		}
 
-		return procConn(data, dataLength, client)
+		return procConn(data, client)
 	}
+
 	// DISCONNECT
 	if packetTypeBits == DISCONNECT_PACKET_ID {
 		procDisconnect(data, dataLength, client)
@@ -227,16 +240,46 @@ func procPublish(receivedData *[]byte, dataLength *int, client *Client) {
 	}
 }
 
-func procConn(receivedData *[]byte, dataLength *int, client *Client) error {
-	// Exemplo:
-	// 10 | 1F <- Fixed header (1. packet type 2. remaining packet length)
-	// 00 04 | 4D 51 54 54 | 05 | C2 | 00 3C <- Variable header (Order: 1. Protocol name length; 2. Protocol name; 3. Protocol level; 4. Connect flags; 5. Keep alive)
-	// Connect flags order: bit7 = username; bit6 = password; bit5 = will retain; bit4-3 = will qos; bit2 = has will; bit1 = clean session; bit0 = reserved.
-	// 00 0B | 63 6C 69 65 6E 74 2D 30 30 31 <- 1. size of client id 2. client id
-	// 00 08 | 75 73 65 72 6E 61 6D 65 <- 1. username length 2. username
-	// 00 08 | 70 61 73 73 77 6F 72 64 <- 1. password length 2. password
+func procConn(receivedData *[]byte, client *Client) error {
+	log.Printf("Received CONNECT packet data: % X\n", *receivedData)
+
+	connectFlags := (*receivedData)[9]
+	log.Printf("Connect Flags byte: %08b\n", connectFlags)
+
+	(*client.flags) = Flags{
+		hasUsername:  (connectFlags&(1<<7) != 0),
+		hasPassword:  (connectFlags&(1<<6) != 0),
+		willRetain:   (connectFlags&(1<<5) != 0),
+		hasWill:      (connectFlags&(1<<2) != 0),
+		cleanSession: (connectFlags&(1<<1) != 0),
+		reserved:     (connectFlags&(1<<0) != 0),
+		willQOS:      int((connectFlags & (1<<3 | 1<<4)) >> 3),
+		keepAlive:    int(binary.BigEndian.Uint16((*receivedData)[10:12])),
+	}
+
+	clientIdLenght := int(binary.BigEndian.Uint16((*receivedData)[12:14]))
+	client.id = string((*receivedData)[14 : 14+clientIdLenght])
+
+	log.Println("Extracted Connect Flags:")
+	log.Printf("  hasUsername:  %v\n", (*client.flags).hasUsername)
+	log.Printf("  hasPassword:  %v\n", (*client.flags).hasPassword)
+	log.Printf("  willRetain:   %v\n", (*client.flags).willRetain)
+	log.Printf("  hasWill:      %v\n", (*client.flags).hasWill)
+	log.Printf("  cleanSession: %v\n", (*client.flags).cleanSession)
+	log.Printf("  reserved:     %v\n", (*client.flags).reserved)
+	log.Printf("  willQOS:      %d\n", (*client.flags).willQOS)
+	log.Printf("  keepAlive:    %d seconds\n", (*client.flags).keepAlive)
+	log.Printf("Keep Alive value: %d seconds\n", (*client.flags).keepAlive)
+
+	if (*client.flags).keepAlive > 0 {
+		(*client.connTicker).keepAliveCountdown = (*client.flags).keepAlive
+		(*client.connTicker).ticker = time.NewTicker(1 * time.Second)
+		go keepaliveTracker(client)
+		log.Println("Keep alive countdown set.")
+	}
+
+	// write connack
 	return nil
-	// Ativar ou não mecanismo de keep alive
 }
 
 func procDisconnect(receivedData *[]byte, dataLength *int, client *Client) {
@@ -261,8 +304,8 @@ func keepaliveTracker(client *Client) {
 			if client.connTicker != nil {
 				select {
 				case <-client.connTicker.ticker.C:
-					client.connTicker.keepAliveInterval--
-					if client.connTicker.keepAliveInterval == 0 {
+					client.connTicker.keepAliveCountdown--
+					if client.connTicker.keepAliveCountdown == 0 {
 						client.cancel()
 					}
 				}
@@ -287,13 +330,14 @@ func handleConnection(conn *net.Conn, appCtx *context.Context) {
 	clientCtx, cancel := context.WithCancel(*appCtx)
 
 	newClient := Client{
-		id:         strconv.Itoa(generateRandomId()),
+		id:         "unknown_" + strconv.Itoa(generateRandomId()),
 		conn:       conn,
 		ctx:        clientCtx,
 		cancel:     cancel,
 		outboxChan: make(chan Packet, 100),
 		inboxChan:  make(chan Packet, 100),
-		connTicker: nil,
+		connTicker: &ConnTicker{},
+		flags:      &Flags{},
 	}
 
 	go connInbox(&newClient)
