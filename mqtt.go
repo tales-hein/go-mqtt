@@ -19,21 +19,27 @@ import (
 )
 
 const (
-	CONNECT_PACKET_ID     = 0b0001
-	CONNACK_PACKET_ID     = 0b0010
-	PUBLISH_PACKET_ID     = 0b0011
-	PUBACK_PACKET_ID      = 0b0100
-	PUBREC_PACKET_ID      = 0b0101
-	PUBREL_PACKET_ID      = 0b0110
-	PUBCOMP_PACKET_ID     = 0b0111
-	SUBSCRIBE_PACKET_ID   = 0b1000
-	SUBACK_PACKET_ID      = 0b1001
-	UNSUBSCRIBE_PACKET_ID = 0b1010
-	UNSUBACK_PACKET_ID    = 0b1011
-	PINGREQ_PACKET_ID     = 0b1100
-	PINGRESP_PACKET_ID    = 0b1101
-	DISCONNECT_PACKET_ID  = 0b1110
-	PORT                  = "1234"
+	CONNECT_PACKET_ID     = byte(0x10)
+	CONNACK_PACKET_ID     = byte(0x20)
+	PUBLISH_PACKET_ID_0   = byte(0x30)
+	PUBLISH_PACKET_ID_1   = byte(0x32)
+	PUBLISH_PACKET_ID_2   = byte(0x34)
+	PUBACK_PACKET_ID      = byte(0x40)
+	PUBREC_PACKET_ID      = byte(0x50)
+	PUBREL_PACKET_ID      = byte(0x60)
+	PUBCOMP_PACKET_ID     = byte(0x70)
+	SUBSCRIBE_PACKET_ID   = byte(0x80)
+	SUBACK_PACKET_ID      = byte(0x90)
+	UNSUBSCRIBE_PACKET_ID = byte(0xA0)
+	UNSUBACK_PACKET_ID    = byte(0xB0)
+	PINGREQ_PACKET_ID     = byte(0xC0)
+	PINGRESP_PACKET_ID    = byte(0xD0)
+	DISCONNECT_PACKET_ID  = byte(0xE0)
+
+	CONNECTION_ACCEPTED_BYTE           = byte(0x0)
+	UNACCEPTABLE_PROTOCOL_VERSION_BYTE = byte(0x01)
+
+	PORT = "1234"
 )
 
 const (
@@ -116,10 +122,10 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 		return err
 	}
 
-	packetTypeBits := (*data)[0] >> 4
+	packetTypeByte := (*data)[0]
 
 	// CONNECT
-	if packetTypeBits == CONNECT_PACKET_ID {
+	if packetTypeByte == CONNECT_PACKET_ID {
 		protocolNameLength := int(binary.BigEndian.Uint16((*data)[2:4]))
 		if protocolNameLength != 4 {
 			err = errors.New(fmt.Sprintf("Unsuported protocol length. Ending connection. Received data: % X\n", *data))
@@ -132,35 +138,62 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 			return err
 		}
 
-		return procConn(data, client)
+		protocolLevel := int((*data)[8])
+		if protocolLevel != 4 {
+			err = errors.New(fmt.Sprintf("Unsuported protocol level. Ending connection. Received data: % X\n", *data))
+			procConnack(client, UNACCEPTABLE_PROTOCOL_VERSION_BYTE)
+			return err
+		}
+
+		err := procConn(data, client)
+		if err != nil {
+			return err
+		}
+
+		procConnack(client, CONNECTION_ACCEPTED_BYTE)
+
+		return nil
 	}
 
 	// DISCONNECT
-	if packetTypeBits == DISCONNECT_PACKET_ID {
-		procDisconnect(data, dataLength, client)
+	if packetTypeByte == DISCONNECT_PACKET_ID {
+		log.Println("Client requested disconnect.")
+		client.cancel()
+		return nil
 	}
 
-	// PUBLISH
-	if packetTypeBits == PUBLISH_PACKET_ID {
+	// PUBLISH QoS 0
+	if packetTypeByte == PUBLISH_PACKET_ID_0 {
+		procPublish(data, dataLength, client)
+	}
+
+	// PUBLISH QoS 1
+	if packetTypeByte == PUBLISH_PACKET_ID_1 {
+		procPublish(data, dataLength, client)
+	}
+
+	// PUBLISH QoS 2
+	if packetTypeByte == PUBLISH_PACKET_ID_2 {
 		procPublish(data, dataLength, client)
 	}
 
 	// SUBSCRIBE
-	if packetTypeBits == SUBSCRIBE_PACKET_ID {
+	if packetTypeByte == SUBSCRIBE_PACKET_ID {
 		procSubscription(data, dataLength, client)
 	}
 
 	// UNSUBSCRIBE
-	if packetTypeBits == UNSUBACK_PACKET_ID {
+	if packetTypeByte == UNSUBACK_PACKET_ID {
 		procUnsub(data, dataLength, client)
 	}
 
 	// PINGREQ
-	if packetTypeBits == PINGREQ_PACKET_ID {
-		procPingreq(data, dataLength, client)
+	if packetTypeByte == PINGREQ_PACKET_ID {
+		procPingreq(client)
+		return nil
 	}
 
-	err = errors.New(fmt.Sprintf("Error: could not interpret packet type. Received data: %s\n", *data))
+	err = errors.New(fmt.Sprintf("Error: could not interpret packet type. Received data: % X\n", *data))
 	return err
 }
 
@@ -214,10 +247,6 @@ func connInbox(client *Client) {
 		default:
 			receivedData := make([]byte, 128)
 			dataLength, err := (*client.conn).Read(receivedData)
-			if err != nil {
-				log.Printf("Error: problems while handling conn read op: %s\n", err)
-				client.cancel()
-			}
 			if dataLength > 0 {
 				trimmedData := make([]byte, dataLength)
 				copy(trimmedData, receivedData[:dataLength])
@@ -254,7 +283,7 @@ func procConn(receivedData *[]byte, client *Client) error {
 		cleanSession: (connectFlags&(1<<1) != 0),
 		reserved:     (connectFlags&(1<<0) != 0),
 		willQOS:      int((connectFlags & (1<<3 | 1<<4)) >> 3),
-		keepAlive:    int(binary.BigEndian.Uint16((*receivedData)[10:12])),
+		keepAlive:    int(binary.BigEndian.Uint16((*receivedData)[10:12])) + int(binary.BigEndian.Uint16((*receivedData)[10:12]))/2,
 	}
 
 	clientIdLenght := int(binary.BigEndian.Uint16((*receivedData)[12:14]))
@@ -278,14 +307,57 @@ func procConn(receivedData *[]byte, client *Client) error {
 		log.Println("Keep alive countdown set.")
 	}
 
-	// write connack
 	return nil
 }
 
-func procDisconnect(receivedData *[]byte, dataLength *int, client *Client) {
+func procConnack(client *Client, status byte) {
+	var packet [4]byte
+
+	packet[0] = CONNACK_PACKET_ID
+	packet[1] = byte(0x2)
+
+	if client.flags.cleanSession || status != CONNECTION_ACCEPTED_BYTE {
+		packet[2] = byte(0x0)
+	} else {
+		packet[2] = byte(0x1)
+	}
+
+	packet[3] = status
+
+	wrote, err := (*client.conn).Write(packet[:])
+	if err != nil {
+		log.Printf("Error while writing packet: %s.\n", err)
+		client.cancel()
+	}
+
+	if wrote != len(packet) {
+		log.Printf("Error: written byte differ in size to source byte data. Sent: %d Data length: %d.\n", wrote, len(packet))
+		client.cancel()
+	}
+
+	log.Printf("Connack packet sent. Packet:  % X\n", packet)
 }
 
-func procPingreq(receivedData *[]byte, dataLength *int, client *Client) {
+func procPingreq(client *Client) {
+	var packet [2]byte
+
+	packet[0] = PINGRESP_PACKET_ID
+	packet[1] = byte(0x0)
+
+	wrote, err := (*client.conn).Write(packet[:])
+	if err != nil {
+		log.Printf("Error while writing packet: %s.\n", err)
+		client.cancel()
+	}
+
+	if wrote != len(packet) {
+		log.Printf("Error: written byte differ in size to source byte data. Sent: %d Data length: %d.\n", wrote, len(packet))
+		client.cancel()
+	}
+
+	client.connTicker.keepAliveCountdown = (*client.flags).keepAlive
+
+	log.Printf("Pingresp packet sent. Packet:  % X\n", packet)
 }
 
 func procSubscription(receivedData *[]byte, dataLength *int, client *Client) {
