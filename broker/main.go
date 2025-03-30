@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -52,6 +50,11 @@ type ConnTicker struct {
 	keepAliveCountdown int
 }
 
+type Message struct {
+	topic   string
+	payload []byte
+}
+
 type Flags struct {
 	hasUsername  bool
 	hasPassword  bool
@@ -85,9 +88,6 @@ type TypedSyncMap[K comparable, V any] struct {
 	m sync.Map
 }
 
-var subscriptionMap TypedSyncMap[string, []string]
-var writeWaitGroup sync.WaitGroup
-
 func (t *TypedSyncMap[K, V]) Store(key K, value V) {
 	t.m.Store(key, value)
 }
@@ -110,6 +110,10 @@ func (t *TypedSyncMap[K, V]) Range(f func(K, V) bool) {
 		return f(key.(K), value.(V))
 	})
 }
+
+var subscriptionMap TypedSyncMap[string, []string]
+var pubRelQueue TypedSyncMap[uint16, *Message]
+var writeWaitGroup sync.WaitGroup
 
 func generateRandomId() int {
 	return rand.Intn(10000)
@@ -141,7 +145,7 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 		protocolLevel := int((*data)[8])
 		if protocolLevel != 4 {
 			err = errors.New(fmt.Sprintf("Unsuported protocol level. Ending connection. Received data: % X\n", *data))
-			procConnack(client, UNACCEPTABLE_PROTOCOL_VERSION_BYTE)
+			sendConnack(client, UNACCEPTABLE_PROTOCOL_VERSION_BYTE)
 			return err
 		}
 
@@ -150,7 +154,7 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 			return err
 		}
 
-		procConnack(client, CONNECTION_ACCEPTED_BYTE)
+		sendConnack(client, CONNECTION_ACCEPTED_BYTE)
 
 		return nil
 	}
@@ -164,17 +168,26 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 
 	// PUBLISH QoS 0
 	if packetTypeByte == PUBLISH_PACKET_ID_0 {
-		procPublish(data, dataLength, client)
+		procPublish(data, client, 0)
+		return nil
 	}
 
 	// PUBLISH QoS 1
 	if packetTypeByte == PUBLISH_PACKET_ID_1 {
-		procPublish(data, dataLength, client)
+		procPublish(data, client, 1)
+		return nil
 	}
 
 	// PUBLISH QoS 2
 	if packetTypeByte == PUBLISH_PACKET_ID_2 {
-		procPublish(data, dataLength, client)
+		procPublish(data, client, 2)
+		return nil
+	}
+
+	// PUBREL
+	if packetTypeByte == PUBREL_PACKET_ID {
+		procPubRel(data, client)
+		return nil
 	}
 
 	// SUBSCRIBE
@@ -260,13 +273,122 @@ func connInbox(client *Client) {
 	}
 }
 
-func procPublish(receivedData *[]byte, dataLength *int, client *Client) {
-	var payload Packet
-	err := json.Unmarshal(bytes.TrimRight((*receivedData)[:*dataLength], "\x00"), &payload)
-	if err != nil {
-		log.Printf("Error: received data does not comply with expected format: %s\n", err)
-		(*client.conn).Close()
+func procPublish(receivedData *[]byte, client *Client, qosLevel int) {
+	log.Printf("Received PUBLISH packet data: % X\n", *receivedData)
+
+	dataLength := len(*receivedData)
+	if dataLength < 4 {
+		log.Println("Error: Packet length invalid for PUBLISH MQTT packet. Received data: % X", *receivedData)
+		client.cancel()
+		return
 	}
+
+	topicLength := int(binary.BigEndian.Uint16((*receivedData)[2:4]))
+	if 4+topicLength > dataLength {
+		log.Println("Error: Invalid topic length in PUBLISH packet.")
+		client.cancel()
+		return
+	}
+
+	topic := string((*receivedData)[4 : 4+topicLength])
+
+	var payloadStart int
+	var packetID uint16
+
+	if qosLevel > 0 {
+		if 4+topicLength+2 > dataLength {
+			log.Println("Error: Missing packet identifier in PUBLISH packet.")
+			return
+		}
+		packetID = binary.BigEndian.Uint16((*receivedData)[4+topicLength : 6+topicLength])
+		payloadStart = 6 + topicLength
+	} else {
+		payloadStart = 4 + topicLength
+	}
+
+	payload := (*receivedData)[payloadStart:dataLength]
+
+	log.Printf("Received PUBLISH packet - Topic: %s, QoS: %d, Packet ID: %d, Payload: %s\n", topic, qosLevel, packetID, payload)
+
+	switch qosLevel {
+	case 0:
+		deliverMessage(topic, payload)
+	case 1:
+		deliverMessage(topic, payload)
+		sendPubAck(client, packetID)
+	case 2:
+		sendPubRec(client, packetID)
+		pubRelQueue.Store(packetID, &Message{topic, payload})
+	}
+}
+
+func sendPubAck(client *Client, packetID uint16) {
+	var packet [4]byte
+	packet[0] = PUBACK_PACKET_ID
+	packet[1] = 0x02
+	binary.BigEndian.PutUint16(packet[2:], packetID)
+
+	wrote, err := (*client.conn).Write(packet[:])
+	if err != nil {
+		log.Printf("Error sending PUBACK: %s\n", err)
+		client.cancel()
+		return
+	}
+
+	if wrote != len(packet) {
+		log.Printf("Error: PUBACK sent length mismatch. Sent: %d, Expected: %d\n", wrote, len(packet))
+		client.cancel()
+	}
+
+	log.Printf("PUBACK sent for Packet ID: %d\n", packetID)
+}
+
+func sendPubRec(client *Client, packetID uint16) {
+	var packet [4]byte
+	packet[0] = PUBREC_PACKET_ID
+	binary.BigEndian.PutUint16(packet[2:], packetID)
+
+	wrote, err := (*client.conn).Write(packet[:])
+	if err != nil {
+		log.Printf("Error sending PUBREC: %s\n", err)
+		client.cancel()
+		return
+	}
+
+	if wrote != len(packet) {
+		log.Printf("Error: PUBREC sent length mismatch. Sent: %d, Expected: %d\n", wrote, len(packet))
+		client.cancel()
+	}
+
+	log.Printf("PUBREC sent for Packet ID: %d\n", packetID)
+}
+
+func procPubRel(receivedData *[]byte, client *Client) {
+	log.Printf("Received PUBREL packet data: % X\n", *receivedData)
+}
+
+func sendPubComp(client *Client, packetID uint16) {
+	var packet [4]byte
+	packet[0] = PUBCOMP_PACKET_ID
+	binary.BigEndian.PutUint16(packet[2:], packetID)
+
+	wrote, err := (*client.conn).Write(packet[:])
+	if err != nil {
+		log.Printf("Error sending PUBCOMP: %s\n", err)
+		client.cancel()
+		return
+	}
+
+	if wrote != len(packet) {
+		log.Printf("Error: PUBCOMP sent length mismatch. Sent: %d, Expected: %d\n", wrote, len(packet))
+		client.cancel()
+	}
+
+	log.Printf("PUBCOMP sent for Packet ID: %d\n", packetID)
+}
+
+func deliverMessage(topic string, payload []byte) {
+	log.Printf("Delivering message to topic: %s, Payload: %s\n", topic, payload)
 }
 
 func procConn(receivedData *[]byte, client *Client) error {
@@ -310,7 +432,7 @@ func procConn(receivedData *[]byte, client *Client) error {
 	return nil
 }
 
-func procConnack(client *Client, status byte) {
+func sendConnack(client *Client, status byte) {
 	var packet [4]byte
 
 	packet[0] = CONNACK_PACKET_ID
@@ -386,14 +508,6 @@ func keepaliveTracker(client *Client) {
 	}
 }
 
-func createPingespPacket(client *Client) (packet Packet, err error) {
-	return packet, nil
-}
-
-func createConnackPakcet(client *Client) (packet Packet, err error) {
-	return packet, nil
-}
-
 func packetStructToByte(packet *Packet) (byteData []byte, err error) {
 	return byteData, nil
 }
@@ -422,6 +536,7 @@ func main() {
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 
 	subscriptionMap = TypedSyncMap[string, []string]{}
+	pubRelQueue = TypedSyncMap[uint16, *Message]{}
 
 	ln, err := net.Listen("tcp", ":"+PORT)
 	if err != nil {
