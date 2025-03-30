@@ -24,7 +24,7 @@ const (
 	PUBLISH_PACKET_ID_2   = byte(0x34)
 	PUBACK_PACKET_ID      = byte(0x40)
 	PUBREC_PACKET_ID      = byte(0x50)
-	PUBREL_PACKET_ID      = byte(0x60)
+	PUBREL_PACKET_ID      = byte(0x62)
 	PUBCOMP_PACKET_ID     = byte(0x70)
 	SUBSCRIBE_PACKET_ID   = byte(0x80)
 	SUBACK_PACKET_ID      = byte(0x90)
@@ -206,8 +206,8 @@ func handlePayload(data *[]byte, dataLength *int, client *Client) (err error) {
 		return nil
 	}
 
-	err = errors.New(fmt.Sprintf("Error: could not interpret packet type. Received data: % X\n", *data))
-	return err
+	log.Printf("Error: could not interpret packet type. Received data: % X\n", *data)
+	return nil
 }
 
 func connOutbbox(client *Client) {
@@ -278,7 +278,7 @@ func procPublish(receivedData *[]byte, client *Client, qosLevel int) {
 
 	dataLength := len(*receivedData)
 	if dataLength < 4 {
-		log.Println("Error: Packet length invalid for PUBLISH MQTT packet. Received data: % X", *receivedData)
+		log.Printf("Error: Packet length invalid for PUBLISH MQTT packet. Received data: % X\n", *receivedData)
 		client.cancel()
 		return
 	}
@@ -346,7 +346,10 @@ func sendPubAck(client *Client, packetID uint16) {
 func sendPubRec(client *Client, packetID uint16) {
 	var packet [4]byte
 	packet[0] = PUBREC_PACKET_ID
+	packet[1] = 0x02
 	binary.BigEndian.PutUint16(packet[2:], packetID)
+
+	log.Printf("Sending PUBREC packet data: % X\n", packet)
 
 	wrote, err := (*client.conn).Write(packet[:])
 	if err != nil {
@@ -365,11 +368,34 @@ func sendPubRec(client *Client, packetID uint16) {
 
 func procPubRel(receivedData *[]byte, client *Client) {
 	log.Printf("Received PUBREL packet data: % X\n", *receivedData)
+
+	dataLength := len(*receivedData)
+	if !(dataLength == 4) {
+		log.Printf("Error: Packet length invalid for PUBREL MQTT packet. Received data: % X\n", *receivedData)
+		client.cancel()
+		return
+	}
+
+	packetID := binary.BigEndian.Uint16((*receivedData)[2:])
+
+	message, exists := pubRelQueue.Load(packetID)
+	if !exists {
+		log.Printf("Error: could not find payload and topic on PUB for packetID: %v\n", packetID)
+		client.cancel()
+		return
+	}
+
+	sendPubComp(client, packetID)
+
+	deliverMessage(message.topic, message.payload)
+
+	pubRelQueue.Delete(packetID)
 }
 
 func sendPubComp(client *Client, packetID uint16) {
 	var packet [4]byte
 	packet[0] = PUBCOMP_PACKET_ID
+	packet[1] = 0x02
 	binary.BigEndian.PutUint16(packet[2:], packetID)
 
 	wrote, err := (*client.conn).Write(packet[:])
