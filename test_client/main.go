@@ -20,12 +20,9 @@ func main() {
 	opts.AddBroker(broker)
 	opts.SetClientID(clientID)
 	opts.SetDefaultPublishHandler(messageHandler)
-	opts.SetProtocolVersion(4)  // MQTT 3.1.1
-	opts.SetOrderMatters(false) // Improve performance
+	opts.SetProtocolVersion(4) // MQTT 3.1.1
+	// opts.SetOrderMatters(false) // Improve performance
 
-	mqtt.DEBUG = func(format string, v ...interface{}) {
-		fmt.Printf("[DEBUG] "+format+"\n", v...)
-	}
 	// Enable debugging logs
 	opts.SetOnConnectHandler(func(client mqtt.Client) {
 		fmt.Println("Connected to broker")
@@ -41,12 +38,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subscribe to multiple topics
+	topicFilters := map[string]byte{
+		"topic/one":   0,
+		"topic/two":   1,
+		"topic/three": 2,
+	}
+
+	// Message handler
+	callback := func(client mqtt.Client, msg mqtt.Message) {
+		fmt.Printf("Received on topic %s: %s\n", msg.Topic(), msg.Payload())
+	}
+
+	// Subscribe to all topics with the shared callback
+	if token := client.SubscribeMultiple(topicFilters, callback); token.Wait() && token.Error() != nil {
+		fmt.Println("Error subscribing to topics:", token.Error())
+		os.Exit(1)
+	}
+	fmt.Println("Subscribed to topics:", topicFilters)
+
 	// Subscribe to the topic
-	// if token := client.Subscribe(topic, 1, nil); token.Wait() && token.Error() != nil {
-	// 	fmt.Println("Error subscribing to topic:", token.Error())
-	// 	os.Exit(1)
-	// }
-	// fmt.Println("Subscribed to topic:", topic)
+	if token := client.Subscribe(topic, 2, callback); token.Wait() && token.Error() != nil {
+		fmt.Println("Error subscribing to topic:", token.Error())
+		os.Exit(1)
+	}
+	fmt.Println("Subscribed to topic:", topic)
 
 	// Publish a message every 5 seconds
 	for i := 1; i <= 5; i++ {
@@ -58,6 +74,25 @@ func main() {
 		}
 		time.Sleep(5 * time.Second)
 	}
+
+	// Unsub to the topic
+	if token := client.Unsubscribe(topic); token.Wait() && token.Error() != nil {
+		fmt.Println("Error unsubscribing to topic:", token.Error())
+		os.Exit(1)
+	}
+	fmt.Println("Unsubscribing to topic:", topic)
+
+	// Unsubscribe from multiple topics
+	topics := make([]string, 0, len(topicFilters))
+	for topic := range topicFilters {
+		topics = append(topics, topic)
+	}
+
+	if token := client.Unsubscribe(topics...); token.Wait() && token.Error() != nil {
+		fmt.Println("Error unsubscribing from topics:", token.Error())
+		os.Exit(1)
+	}
+	fmt.Println("Unsubscribed from topics:", topics)
 
 	// Disconnect from the broker
 	client.Disconnect(250)
